@@ -27,6 +27,9 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 
+#include <sys/socket.h>
+#include <sys/un.h>
+
 #include "../egl/goldfish_sync.h"
 
 #include "ThreadInfo.h"
@@ -43,28 +46,6 @@ static hwc2_function_pointer_t asFP(T function)
     static_assert(std::is_same<PFN, T>::value, "Incompatible function pointer");
     return reinterpret_cast<hwc2_function_pointer_t>(function);
 }
-
-static HostConnection *sHostCon = nullptr;
-
-static HostConnection* createOrGetHostConnection() {
-    if (!sHostCon) {
-        sHostCon = HostConnection::createUnique();
-    }
-    return sHostCon;
-}
-
-#define DEFINE_AND_VALIDATE_HOST_CONNECTION \
-    HostConnection *hostCon = createOrGetHostConnection(); \
-    if (!hostCon) { \
-        ALOGE("EmuHWC2: Failed to get host connection\n"); \
-        return Error::NoResources; \
-    } \
-    ExtendedRCEncoderContext *rcEnc = hostCon->rcEncoder(); \
-    if (!rcEnc) { \
-        ALOGE("EmuHWC2: Failed to get renderControl encoder context\n"); \
-        return Error::NoResources; \
-    }
-
 
 using namespace HWC2;
 
@@ -693,136 +674,11 @@ Error EmuHWC2::Display::present(int32_t* outRetireFence) {
     }
     mChanges.reset();
 
-    DEFINE_AND_VALIDATE_HOST_CONNECTION
-    hostCon->lock();
-    bool hostCompositionV1 = rcEnc->hasHostCompositionV1();
-    hostCon->unlock();
-
-    if (hostCompositionV1) {
-        uint32_t numLayer = 0;
-        for (auto layer: mLayers) {
-            if (layer->getCompositionType() == Composition::Device ||
-                layer->getCompositionType() == Composition::SolidColor) {
-                numLayer++;
-            }
-        }
-
-        ALOGVV("present %d layers total %u layers",
-              numLayer, (uint32_t)mLayers.size());
-
-        mReleaseLayerIds.clear();
-        mReleaseFences.clear();
-
-        if (numLayer == 0) {
-            ALOGVV("No layers, exit");
-            mGralloc->getFb()->post(mGralloc->getFb(), mClientTarget.getBuffer());
-            *outRetireFence = mClientTarget.getFence();
-            return Error::None;
-        }
-
-        if (mComposeMsg == nullptr || mComposeMsg->getLayerCnt() < numLayer) {
-            mComposeMsg.reset(new ComposeMsg(numLayer));
-        }
-
-        // Handle the composition
-        ComposeDevice* p = mComposeMsg->get();
-        ComposeLayer* l = p->layer;
-
-        for (auto layer: mLayers) {
-            if (layer->getCompositionType() != Composition::Device &&
-                layer->getCompositionType() != Composition::SolidColor) {
-                ALOGE("%s: Unsupported composition types %d layer %u",
-                      __FUNCTION__, layer->getCompositionType(),
-                      (uint32_t)layer->getId());
-                continue;
-            }
-            // send layer composition command to host
-            if (layer->getCompositionType() == Composition::Device) {
-                int fence = layer->getLayerBuffer().getFence();
-                mReleaseLayerIds.push_back(layer->getId());
-                if (fence != -1) {
-                    int err = sync_wait(fence, 3000);
-                    if (err < 0 && errno == ETIME) {
-                        ALOGE("%s waited on fence %d for 3000 ms",
-                            __FUNCTION__, fence);
-                    }
-                    close(fence);
-                }
-                else {
-                    ALOGV("%s: acquire fence not set for layer %u",
-                          __FUNCTION__, (uint32_t)layer->getId());
-                }
-                cb_handle_t *cb =
-                    (cb_handle_t *)layer->getLayerBuffer().getBuffer();
-                if (cb != nullptr) {
-                    l->cbHandle = cb->hostHandle;
-                }
-                else {
-                    ALOGE("%s null buffer for layer %d", __FUNCTION__,
-                          (uint32_t)layer->getId());
-                }
-            }
-            else {
-                // solidcolor has no buffer
-                l->cbHandle = 0;
-            }
-            l->composeMode = (hwc2_composition_t)layer->getCompositionType();
-            l->displayFrame = layer->getDisplayFrame();
-            l->crop = layer->getSourceCrop();
-            l->blendMode = layer->getBlendMode();
-            l->alpha = layer->getPlaneAlpha();
-            l->color = layer->getColor();
-            l->transform = layer->getTransform();
-            ALOGV("   cb %d blendmode %d alpha %f %d %d %d %d z %d"
-                  " composeMode %d, transform %d",
-                  l->cbHandle, l->blendMode, l->alpha,
-                  l->displayFrame.left, l->displayFrame.top,
-                  l->displayFrame.right, l->displayFrame.bottom,
-                  layer->getZ(), l->composeMode, l->transform);
-            l++;
-        }
-        p->version = 1;
-        p->targetHandle = mGralloc->getTargetCb();
-        p->numLayers = numLayer;
-
-        hostCon->lock();
-        rcEnc->rcCompose(rcEnc,
-                         sizeof(ComposeDevice) + numLayer * sizeof(ComposeLayer),
-                         (void *)p);
-        hostCon->unlock();
-
-        // Send a retire fence and use it as the release fence for all layers,
-        // since media expects it
-        EGLint attribs[] = { EGL_SYNC_NATIVE_FENCE_ANDROID, EGL_NO_NATIVE_FENCE_FD_ANDROID };
-
-        uint64_t sync_handle, thread_handle;
-        int retire_fd;
-
-        hostCon->lock();
-        rcEnc->rcCreateSyncKHR(rcEnc, EGL_SYNC_NATIVE_FENCE_ANDROID,
-                attribs, 2 * sizeof(EGLint), true /* destroy when signaled */,
-                &sync_handle, &thread_handle);
-        hostCon->unlock();
-
-        goldfish_sync_queue_work(mSyncDeviceFd,
-                sync_handle, thread_handle, &retire_fd);
-
-        for (size_t i = 0; i < mReleaseLayerIds.size(); ++i) {
-            mReleaseFences.push_back(dup(retire_fd));
-        }
-
-        *outRetireFence = dup(retire_fd);
-        close(retire_fd);
-        hostCon->lock();
-        rcEnc->rcDestroySyncKHR(rcEnc, sync_handle);
-        hostCon->unlock();
-    } else {
-        // we set all layers Composition::Client, so do nothing.
-        mGralloc->getFb()->post(mGralloc->getFb(), mClientTarget.getBuffer());
-        *outRetireFence = mClientTarget.getFence();
-        ALOGV("%s fallback to post, returns outRetireFence %d",
-              __FUNCTION__, *outRetireFence);
-    }
+    // we set all layers Composition::Client, so do nothing.
+    mGralloc->getFb()->post(mGralloc->getFb(), mClientTarget.getBuffer());
+    *outRetireFence = mClientTarget.getFence();
+    ALOGV("%s fallback to post, returns outRetireFence %d",
+          __FUNCTION__, *outRetireFence);
 
     return Error::None;
 }
@@ -908,6 +764,43 @@ static bool isValid(PowerMode mode) {
     }
 }
 
+static void notify_hx_touchd(int enable)
+{
+    static const char *socket_name = "/dev/socket/hx-touchd-ctrl";
+    struct sockaddr_un saddr;
+    int fd;
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if(fd < 0) {
+        ALOGE("failed to create UNIX socket for hx-touchd notification");
+        return;
+    }
+
+    memset(&saddr, 0, sizeof(saddr));
+    saddr.sun_family = AF_UNIX;
+    strncpy(saddr.sun_path, socket_name, sizeof(saddr.sun_path) - 1);
+    if(connect(fd, (struct sockaddr *)&saddr, sizeof(saddr)) < 0) {
+        close(fd);
+        ALOGE("failed to connect UNIX socket to hx-touchd");
+        return;
+    }
+
+    if(write(fd, enable ? "1" : "0", 1) != 1) {
+        close(fd);
+        ALOGE("failed to send state notification to hx-touchd");
+        return;
+    }
+
+    close(fd);
+}
+
+static void set_cpu_speed(int enable)
+{
+    FILE *f = fopen("/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq", "w");
+    fprintf(f, "%d\n", enable ? 2340000 : 1356000);
+    fclose(f);
+}
+
 Error EmuHWC2::Display::setPowerMode(int32_t intMode) {
     ALOGVV("%s", __FUNCTION__);
     // Emulator always set screen ON
@@ -919,6 +812,21 @@ Error EmuHWC2::Display::setPowerMode(int32_t intMode) {
         return Error::None;
     }
     std::unique_lock<std::mutex> lock(mStateMutex);
+
+    framebuffer_device_t* fbDev = NULL;
+    if(mGralloc)
+        fbDev = mGralloc->getFb();
+    if(fbDev && fbDev->enableScreen) {
+        if(mode == PowerMode::Off) {
+            notify_hx_touchd(0);
+            fbDev->enableScreen(fbDev, 0);
+            set_cpu_speed(0);
+        } else {
+            set_cpu_speed(1);
+            fbDev->enableScreen(fbDev, 1);
+            notify_hx_touchd(1);
+        }
+    }
 
     ALOGV("%s: (display %u mode %s)", __FUNCTION__,
           (uint32_t)mId, to_string(mode).c_str());
@@ -957,53 +865,11 @@ Error EmuHWC2::Display::validate(uint32_t* outNumTypes,
 
     if (!mChanges) {
         mChanges.reset(new Changes);
-        DEFINE_AND_VALIDATE_HOST_CONNECTION
-        hostCon->lock();
-        bool hostCompositionV1 = rcEnc->hasHostCompositionV1();
-        hostCon->unlock();
 
-        if (hostCompositionV1) {
-            // Support Device and SolidColor, otherwise, fallback all layers
-            // to Client
-            bool fallBack = false;
-            for (auto& layer : mLayers) {
-                if (layer->getCompositionType() == Composition::Invalid) {
-                    // Log error for unused layers, layer leak?
-                    ALOGE("%s layer %u CompositionType(%d) not set",
-                          __FUNCTION__, (uint32_t)layer->getId(),
-                          layer->getCompositionType());
-                    continue;
-                }
-                if (layer->getCompositionType() == Composition::Client ||
-                    layer->getCompositionType() == Composition::Cursor ||
-                    layer->getCompositionType() == Composition::Sideband) {
-                    ALOGW("%s: layer %u CompositionType %d, fallback", __FUNCTION__,
-                         (uint32_t)layer->getId(), layer->getCompositionType());
-                    fallBack = true;
-                    break;
-                }
-            }
-            if (mSetColorTransform) {
-                fallBack = true;
-            }
-            if (fallBack) {
-                for (auto& layer : mLayers) {
-                    if (layer->getCompositionType() == Composition::Invalid) {
-                        continue;
-                    }
-                    if (layer->getCompositionType() != Composition::Client) {
-                        mChanges->addTypeChange(layer->getId(),
-                                                Composition::Client);
-                    }
-                }
-            }
-       }
-       else {
-            for (auto& layer : mLayers) {
-                if (layer->getCompositionType() != Composition::Client) {
-                    mChanges->addTypeChange(layer->getId(),
-                                            Composition::Client);
-                }
+        for (auto& layer : mLayers) {
+            if (layer->getCompositionType() != Composition::Client) {
+                mChanges->addTypeChange(layer->getId(),
+                                        Composition::Client);
             }
         }
     }
